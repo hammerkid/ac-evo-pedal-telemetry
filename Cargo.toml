@@ -1,0 +1,17 @@
+[package]
+name = "racing_pedal_overlay"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent always-on-top HUD overlay for sim racing — pedal graph, gear, speed, steering wheel, and ABS detection"
+license = "MIT"
+repository = "https://github.com/hammerkid/ac-evo-pedal-telemetry"
+keywords = ["sim-racing", "overlay", "telemetry", "egui", "assetto-corsa"]
+categories = ["games", "visualization"]
+
+[dependencies]
+eframe = { version = "0.30", default-features = true }
+egui_plot = "0.30"
+gilrs = "0.11"
+simetry = { version = "0.2.3", default-features = false }
+tokio = { version = "1.51.0", features = ["rt-multi-thread", "time"] }
+uom = "0.34"

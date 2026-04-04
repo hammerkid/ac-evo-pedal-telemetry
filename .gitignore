@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+.cargo/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Scripts
+screenshot.ps1
+
+# Probe logs
+probe_log*.txt
