@@ -16,7 +16,7 @@ Displays real-time pedal inputs (throttle / brake / clutch), gear, speed, and st
 - **Hardware input** — reads pedals and wheel via [`gilrs`](https://crates.io/crates/gilrs) (HID/DirectInput)
 - **Fully resizable** — all widgets scale proportionally; resize grip appears on hover (bottom-right corner)
 - **Borderless & transparent** — rounded-corner overlay with drag-to-move
-- **Debug mode** — press `D` to see raw axis codes (useful for mapping new hardware)
+- **Debug mode** — press `D` to see raw axis codes, pedal inversion toggles, and telemetry diagnostics
 
 ## Hardware
 
@@ -25,7 +25,7 @@ Developed and tested with:
 - **Moza R3** direct-drive wheel
 - **Moza SRP Lite** pedals (2-pedal set)
 
-Other HID gamepads / wheels should work — use the debug overlay (`D`) to identify axis codes.
+Other HID gamepads / wheels should work — use the debug overlay (`D`) to identify axis codes and toggle pedal inversion if your pedals read backwards.
 
 ## Controls
 
@@ -62,7 +62,10 @@ Moza devices report as `RawGameController` via Windows Gaming Input, so axes may
 
 1. Run the overlay and press `D` to open the debug overlay
 2. Press each pedal one at a time and note the axis + code
-3. Update the `match axis` block in `read_inputs()` in `src/main.rs`
+3. If a pedal reads backwards (100% when released, 0% when pressed), click the corresponding **invert** button (`T inv` / `B inv` / `C inv`) in the debug panel
+4. For completely different axis assignments, update the `match axis` block in `read_inputs()` in `src/main.rs`
+
+> **Note:** Inversion settings are runtime-only and reset when the overlay is restarted. The defaults are tuned for Moza SRP Lite pedals (throttle: direct, brake: inverted, clutch: direct).
 
 ## Architecture
 

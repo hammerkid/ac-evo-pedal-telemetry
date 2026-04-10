@@ -10,11 +10,11 @@
 //! ```text
 //! ┌────────────────────────────────────────────────────────────┐
 //! │  main thread (eframe / egui)                               │
-//! │  ┌──────┐ ┌──────┐ ┌───────┐ ┌───────┐                   │
-//! │  │Graph │ │ Gear │ │ Speed │ │ Wheel │  <- custom widgets │
-//! │  └──────┘ └──────┘ └───────┘ └───────┘                   │
-//! │       ▲ gilrs events          ▲ mpsc::Receiver            │
-//! └───────┼───────────────────────┼───────────────────────────┘
+//! │  ┌──────┐ ┌──────┐ ┌───────┐ ┌───────┐                     │
+//! │  │Graph │ │ Gear │ │ Speed │ │ Wheel │  <- custom widgets  │
+//! │  └──────┘ └──────┘ └───────┘ └───────┘                     │
+//! │       ▲ gilrs events          ▲ mpsc::Receiver             │
+//! └───────┼───────────────────────┼────────────────────────────┘
 //!         │                       │
 //!    USB / HID axis       ┌──────┴──────┐
 //!    (pedals, wheel)      │ telemetry   │ <- background thread
@@ -68,6 +68,10 @@ struct TelemetryData {
     max_rpm: Option<f64>,
     abs_active: bool,
     tc_active: bool,
+    /// Raw ABS vibration intensity (0.0–1.0) for precise graph coloring.
+    abs_vibration: f32,
+    /// Steering angle from the game (normalized −1..+1), if available.
+    steer_angle: Option<f32>,
     /// Pedal values for debug logging.
     pedals_game: Option<(f64, f64, f64)>,
     pedals_raw: Option<(f64, f64, f64)>,
@@ -88,8 +92,11 @@ struct AcPhysicsSnapshot {
     gas: f32,
     brake: f32,
     clutch: f32,
+    steer_angle: f32,
     abs_active: bool,
     tc_active: bool,
+    /// Raw ABS vibration value from shared memory (0.0 = off, up to 1.0 = full intervention)
+    abs_vibration: f32,
 }
 
 /// Read ABS status and pedal values from AC's shared memory page.
@@ -125,6 +132,7 @@ fn read_ac_shared_physics() -> Option<AcPhysicsSnapshot> {
         // All fields are i32/f32/[f32;N] — no padding in packed(4).
         let gas            = *(ptr.add(4)   as *const f32);   // offset 4
         let brake          = *(ptr.add(8)   as *const f32);   // offset 8
+        let steer_angle    = *(ptr.add(24)  as *const f32);   // offset 24
         let clutch         = *(ptr.add(364) as *const f32);   // offset 364
 
         // AC Evo: the i32 fields tc_in_action (672) / abs_in_action (676) are
@@ -140,8 +148,10 @@ fn read_ac_shared_physics() -> Option<AcPhysicsSnapshot> {
             gas,
             brake,
             clutch,
-            abs_active: abs_field > 0.5,
+            steer_angle,
+            abs_active: abs_field > 0.01,
             tc_active: tc_field > 0.5,
+            abs_vibration: abs_field.clamp(0.0, 1.0),
         })
     }
 }
@@ -184,10 +194,11 @@ fn spawn_telemetry_thread() -> mpsc::Receiver<TelemetryData> {
                     };
 
                     // ABS detection: prefer AC shared memory, fall back to pedals heuristic
-                    let (abs_active, tc_active, abs_source);
+                    let (abs_active, tc_active, abs_vibration, abs_source);
                     if let Some(ref snap) = ac_snap {
                         abs_active = snap.abs_active;
                         tc_active = snap.tc_active;
+                        abs_vibration = snap.abs_vibration;
                         abs_source = "shm";
                     } else {
                         let pg = moment.pedals().map(|p| (p.throttle, p.brake, p.clutch));
@@ -197,8 +208,12 @@ fn spawn_telemetry_thread() -> mpsc::Receiver<TelemetryData> {
                             _ => false,
                         };
                         tc_active = false;
+                        abs_vibration = if abs_active { 1.0 } else { 0.0 };
                         abs_source = if pg.is_some() && pr.is_some() { "pedals" } else { "none" };
                     }
+
+                    // Steering: prefer AC shm (game applies car steering lock)
+                    let steer_angle = ac_snap.as_ref().map(|s| s.steer_angle);
 
                     // Pedal values: prefer AC shm, fall back to Moment::pedals()
                     let pedals_game = ac_snap
@@ -221,6 +236,8 @@ fn spawn_telemetry_thread() -> mpsc::Receiver<TelemetryData> {
                             .map(|v| v.get::<revolution_per_minute>()),
                         abs_active,
                         tc_active,
+                        abs_vibration,
+                        steer_angle,
                         pedals_game,
                         pedals_raw,
                         abs_source,
@@ -239,11 +256,44 @@ fn spawn_telemetry_thread() -> mpsc::Receiver<TelemetryData> {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Query the primary monitor resolution via Win32 `GetSystemMetrics`.
+/// Returns `(width, height)` in pixels.
+#[cfg(windows)]
+fn primary_monitor_size() -> (u32, u32) {
+    extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSCREEN).max(800) as u32;
+        let h = GetSystemMetrics(SM_CYSCREEN).max(600) as u32;
+        (w, h)
+    }
+}
+
+#[cfg(not(windows))]
+fn primary_monitor_size() -> (u32, u32) {
+    (1920, 1080) // sensible fallback
+}
+
 fn main() -> eframe::Result<()> {
+    let (mon_w, mon_h) = primary_monitor_size();
+
+    // Scale overlay to ~26% of screen width, keeping a ~5:1 aspect ratio.
+    // This looks good from 1080p through 4K.
+    let win_w = (mon_w as f32 * 0.26).clamp(400.0, 1000.0);
+    let win_h = (win_w / 5.0).clamp(80.0, 200.0);
+
+    // Position at bottom-center, 4% above the screen bottom edge
+    let pos_x = (mon_w as f32 - win_w) / 2.0;
+    let pos_y = mon_h as f32 - win_h - (mon_h as f32 * 0.04);
+
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Racing Pedal Overlay")
-            .with_inner_size([500.0, 100.0])
+            .with_inner_size([win_w, win_h])
+            .with_position(egui::pos2(pos_x, pos_y))
             .with_decorations(false)   // borderless — we draw our own frame
             .with_resizable(true)
             .with_transparent(true)    // lets rounded corners show through
@@ -269,7 +319,8 @@ struct Sample {
     throttle: f64,
     brake: f64,
     clutch: f64,
-    abs_active: bool,
+    /// Raw ABS vibration intensity (0.0–1.0) for precise color blending.
+    abs_vibration: f32,
 }
 
 /// Root application state. Holds hardware input values, the scrolling history
@@ -280,7 +331,8 @@ struct OverlayApp {
     throttle: f32,
     brake: f32,
     clutch: f32,
-    steering: f32, // −1.0 full left … 0.0 center … +1.0 full right
+    steering: f32,      // −1.0 full left … 0.0 center … +1.0 full right
+    steering_game: Option<f32>, // steering from game (car lock applied)
 
     // Scrolling graph history (ring buffer, capped to HISTORY_SECONDS)
     history: VecDeque<Sample>,
@@ -297,6 +349,8 @@ struct OverlayApp {
     abs_held: bool,
     abs_hold_until: Option<Instant>,
     tc_active: bool,
+    /// Raw ABS vibration value from latest telemetry tick (0.0–1.0)
+    abs_vibration: f32,
     abs_source: &'static str,
     /// Debug: last pedal values from telemetry (game-modified)
     pedals_game_dbg: Option<(f64, f64, f64)>,
@@ -309,6 +363,11 @@ struct OverlayApp {
     debug_mode: bool,
     debug_log: VecDeque<String>,
     resize_hover_start: Option<Instant>,
+
+    // Pedal axis inversion toggles (for non-Moza hardware)
+    invert_throttle: bool,
+    invert_brake: bool,
+    invert_clutch: bool,
 }
 
 impl OverlayApp {
@@ -332,6 +391,7 @@ impl OverlayApp {
             brake: 0.0,
             clutch: 0.0,
             steering: 0.0,
+            steering_game: None,
             history: VecDeque::new(),
             start_time: Instant::now(),
             last_sample_time: 0.0,
@@ -343,6 +403,7 @@ impl OverlayApp {
             abs_held: false,
             abs_hold_until: None,
             tc_active: false,
+            abs_vibration: 0.0,
             abs_source: "none",
             pedals_game_dbg: None,
             pedals_raw_dbg: None,
@@ -351,6 +412,9 @@ impl OverlayApp {
             debug_mode: false,
             debug_log: VecDeque::new(),
             resize_hover_start: None,
+            invert_throttle: false,
+            invert_brake: true,
+            invert_clutch: false,
         }
     }
 
@@ -393,16 +457,28 @@ impl OverlayApp {
 
                     match axis {
                         // Moza SRP Lite: throttle on LeftZ/LeftStickY,
-                        // brake on RightZ/RightStickY. Uses direct conversion
-                        // (pressed = +1.0). Press D to verify your mapping.
+                        // brake on RightZ/RightStickY. Toggle inversion
+                        // in debug overlay (D) if your pedals read backwards.
                         Axis::LeftZ | Axis::LeftStickY => {
-                            self.throttle = Self::axis_to_pedal(value);
+                            self.throttle = if self.invert_throttle {
+                                Self::axis_to_pedal_inv(value)
+                            } else {
+                                Self::axis_to_pedal(value)
+                            };
                         }
                         Axis::RightZ | Axis::RightStickY => {
-                            self.brake = Self::axis_to_pedal_inv(value);
+                            self.brake = if self.invert_brake {
+                                Self::axis_to_pedal_inv(value)
+                            } else {
+                                Self::axis_to_pedal(value)
+                            };
                         }
                         Axis::RightStickX => {
-                            self.clutch = Self::axis_to_pedal(value);
+                            self.clutch = if self.invert_clutch {
+                                Self::axis_to_pedal_inv(value)
+                            } else {
+                                Self::axis_to_pedal(value)
+                            };
                         }
                         // Steering: Moza R3 may report on LeftStickX, DPadX,
                         // or Unknown. Catch all remaining axes as steering.
@@ -443,7 +519,7 @@ impl OverlayApp {
             throttle: self.throttle as f64,
             brake: self.brake as f64,
             clutch: self.clutch as f64,
-            abs_active: self.abs_held,
+            abs_vibration: self.abs_vibration,
         });
         while let Some(front) = self.history.front() {
             if now - front.t > HISTORY_SECONDS {
@@ -477,6 +553,8 @@ impl OverlayApp {
                 self.abs_held = false;
             }
             self.tc_active = data.tc_active;
+            self.abs_vibration = data.abs_vibration;
+            self.steering_game = data.steer_angle;
             self.abs_source = data.abs_source;
             self.pedals_game_dbg = data.pedals_game;
             self.pedals_raw_dbg = data.pedals_raw;
@@ -493,6 +571,8 @@ impl OverlayApp {
                 self.abs_held = false;
                 self.abs_hold_until = None;
                 self.tc_active = false;
+                self.abs_vibration = 0.0;
+                self.steering_game = None;
                 self.abs_source = "none";
                 self.sim_name.clear();
                 self.last_telemetry = None;
@@ -516,20 +596,20 @@ impl OverlayApp {
         let scale = height / 56.0;
         let line_w = (2.0 * scale).clamp(1.0, 5.0);
 
-        // Split brake history into segments by ABS state
+        // Split brake history into segments by ABS state (on/off).
         let brake_normal_color = Color32::from_rgb(240, 55, 50);
         let brake_abs_color = Color32::from_rgb(255, 160, 20);
         let mut brake_segments: Vec<(Vec<[f64; 2]>, bool)> = Vec::new();
         for s in &self.history {
             let pt = [s.t - now, s.brake * 100.0];
+            let abs_on = s.abs_vibration > 0.01;
             match brake_segments.last_mut() {
-                Some((pts, abs)) if *abs == s.abs_active => pts.push(pt),
-                Some((pts, _prev_abs)) => {
-                    // Bridge: repeat last point so segments connect visually
+                Some((pts, prev)) if *prev == abs_on => pts.push(pt),
+                Some((pts, _prev)) => {
                     let bridge = *pts.last().unwrap();
-                    brake_segments.push((vec![bridge, pt], s.abs_active));
+                    brake_segments.push((vec![bridge, pt], abs_on));
                 }
-                None => brake_segments.push((vec![pt], s.abs_active)),
+                None => brake_segments.push((vec![pt], abs_on)),
             }
         }
 
@@ -557,8 +637,8 @@ impl OverlayApp {
                     .width(width)
                     .show(ui, |plot_ui| {
                         plot_ui.line(Line::new(t_pts).color(Color32::from_rgb(100, 220, 70)).width(line_w));
-                        for (pts, abs) in &brake_segments {
-                            let color = if *abs { brake_abs_color } else { brake_normal_color };
+                        for (pts, abs_on) in &brake_segments {
+                            let color = if *abs_on { brake_abs_color } else { brake_normal_color };
                             plot_ui.line(Line::new(PlotPoints::new(pts.clone())).color(color).width(line_w));
                         }
                         plot_ui.line(Line::new(c_pts).color(Color32::from_rgb(60, 130, 255)).width(line_w * 0.75));
@@ -783,7 +863,8 @@ impl App for OverlayApp {
                     self.draw_graph(ui, graph_w, h);
                     Self::draw_gear(ui, self.gear, self.rpm_pct, h, gear_w);
                     Self::draw_speed(ui, self.speed_kmh, h, speed_w);
-                    Self::draw_wheel(ui, self.steering, h);
+                    let effective_steer = self.steering_game.unwrap_or(self.steering);
+                    Self::draw_wheel(ui, effective_steer, h);
                 });
 
                 // Resize grip — bottom-right corner, visible after hovering 500ms
@@ -807,11 +888,12 @@ impl App for OverlayApp {
                             );
                             ui.label(
                                 RichText::new(format!(
-                                    "T:{:.0}% B:{:.0}% C:{:.0}% S:{:+.2}",
+                                    "T:{:.0}% B:{:.0}% C:{:.0}% S:{:+.2} Sg:{:+.2}",
                                     self.throttle * 100.0,
                                     self.brake * 100.0,
                                     self.clutch * 100.0,
                                     self.steering,
+                                    self.steering_game.unwrap_or(0.0),
                                 ))
                                 .size(10.0)
                                 .color(Color32::WHITE)
@@ -886,6 +968,39 @@ impl App for OverlayApp {
                                         .monospace(),
                                 );
                             }
+                            // Pedal axis inversion toggles
+                            ui.separator();
+                            ui.label(
+                                RichText::new("Pedal axis inversion:")
+                                    .size(9.0)
+                                    .color(Color32::from_gray(140)),
+                            );
+                            ui.horizontal(|ui| {
+                                let btn = |ui: &mut Ui, label: &str, active: &mut bool| {
+                                    let text = RichText::new(label)
+                                        .size(9.0)
+                                        .monospace()
+                                        .color(if *active {
+                                            Color32::from_rgb(255, 160, 20)
+                                        } else {
+                                            Color32::from_gray(120)
+                                        });
+                                    if ui.add(egui::Button::new(text)
+                                        .fill(if *active {
+                                            Color32::from_rgba_unmultiplied(255, 160, 20, 40)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(60, 60, 80, 80)
+                                        })
+                                        .rounding(Rounding::same(3.0))
+                                    ).clicked() {
+                                        *active = !*active;
+                                    }
+                                };
+                                btn(ui, "T inv", &mut self.invert_throttle);
+                                btn(ui, "B inv", &mut self.invert_brake);
+                                btn(ui, "C inv", &mut self.invert_clutch);
+                            });
+
                             if !self.debug_log.is_empty() {
                                 ui.separator();
                                 for line in &self.debug_log {
