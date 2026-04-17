@@ -17,3 +17,9 @@ screenshot.ps1
 
 # Probe logs
 probe_log*.txt
+
+# Debug overlay (personal use only)
+src/debug.rs
+
+# Stray Windows nul device file
+nul
